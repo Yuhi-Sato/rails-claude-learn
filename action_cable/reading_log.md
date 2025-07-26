@@ -969,3 +969,893 @@ server3 = ActionCable::Server::Base.new  # ビュー用
 - [ ] テスト環境でのシングルトンリセット戦略
 - [ ] パフォーマンス監視でのシングルトンアクセスパターン
 - [ ] 設定ホットリロードとシングルトンの統合
+
+# Action Cable 読書ログ
+
+## Session 7: WebSocket接続からConnectionインスタンス作成まで
+
+**目的**: WebSocketの接続でConnectionインスタンスが作成される過程の理解
+
+### WebSocket接続フローの完全解析
+
+#### 1. HTTP WebSocketアップグレードリクエストの処理
+
+WebSocket接続の開始はHTTPリクエストから始まります：
+
+1. **Rails Router/Rack処理**
+   - クライアントがWebSocketアップグレードリクエストを送信
+   - Action Cableのマウントポイント（通常 `/cable`）でキャッチ
+
+2. **ActionCable::Server::Base#call**
+   - Rackアプリケーションとしてリクエストを受信
+   - `config.connection_class.call.new(self, env).process` でConnectionインスタンス作成・処理
+
+#### 2. Connectionクラスの動的解決メカニズム (`base.rb:41`)
+
+```ruby
+config.connection_class.call.new(self, env).process
+```
+
+**重要な理解**:
+- `connection_class` は **Procオブジェクト** (デフォルト: `-> { ActionCable::Connection::Base }`)
+- Rails環境では `-> { "ApplicationCable::Connection".safe_constantize || ActionCable::Connection::Base }`
+- `.call` でクラスを動的に解決してから `.new` でインスタンス作成
+- これによりユーザー定義の `ApplicationCable::Connection` を優先して使用
+
+#### 3. Connection::Baseインスタンスの作成過程 (`base.rb:67-79`)
+
+```ruby
+def initialize(server, env, coder: ActiveSupport::JSON)
+  @server, @env, @coder = server, env, coder
+  
+  @worker_pool = server.worker_pool
+  @logger = new_tagged_logger
+  
+  @websocket      = ActionCable::Connection::WebSocket.new(env, self, event_loop)
+  @subscriptions  = ActionCable::Connection::Subscriptions.new(self)
+  @message_buffer = ActionCable::Connection::MessageBuffer.new(self)
+  
+  @_internal_subscriptions = nil
+  @started_at = Time.now
+end
+```
+
+**初期化時の依存関係構築**:
+- `@websocket`: WebSocketプロキシを作成（`env`, `self`, `event_loop`を渡す）
+- `@subscriptions`: チャンネルサブスクリプション管理
+- `@message_buffer`: WebSocketメッセージのバッファリング
+- `@worker_pool`: サーバーのWorker Poolを参照
+
+#### 3. WebSocket抽象化レイヤーの構造
+
+**3層構造のWebSocket実装**:
+
+1. **Connection::WebSocket** (`web_socket.rb`)
+   - 外部APIを最小限に抑えるためのプロキシクラス
+   - `possible?`, `protocol`, `transmit`, `close`, `rack_response`メソッドを提供
+   - 実際のWebSocketロジックは`ClientSocket`に移譲
+
+2. **Connection::ClientSocket** (`client_socket.rb`)
+   - `faye-websocket-ruby`ベースの実装
+   - WebSocketプロトコルとステート管理
+   - `::WebSocket::Driver.rack`を使用したWebSocketドライバー作成
+   
+3. **Connection::Stream**
+   - I/Oの実際の管理
+   - Event Loopとの統合
+   - Rackソケットのハイジャック処理
+
+#### 4. WebSocketドライバーの初期化 (`client_socket.rb:36-57`)
+
+```ruby
+def initialize(env, event_target, event_loop, protocols)
+  @env          = env
+  @event_target = event_target  # Connection::Baseインスタンス
+  @event_loop   = event_loop
+  
+  @url = ClientSocket.determine_url(@env)
+  
+  @driver = @driver_started = nil
+  @close_params = ["", 1006]
+  @ready_state = CONNECTING
+  
+  # WebSocketドライバーを作成
+  @driver = ::WebSocket::Driver.rack(self, protocols: protocols)
+  
+  # イベントハンドラーを設定
+  @driver.on(:open)    { |e| open }
+  @driver.on(:message) { |e| receive_message(e.data) }
+  @driver.on(:close)   { |e| begin_close(e.reason, e.code) }
+  @driver.on(:error)   { |e| emit_error(e.message) }
+  
+  @stream = ActionCable::Connection::Stream.new(@event_loop, self)
+end
+```
+
+**重要な設計パターン**:
+- `@event_target`としてConnection::Baseインスタンスを保持
+- WebSocketイベントを対応するConnection::Baseメソッドに委譲
+- `::WebSocket::Driver.rack`でプロトコル準拠のWebSocketドライバー作成
+
+#### 5. Connection処理フロー (`base.rb:85-93`)
+
+```ruby
+def process
+  logger.info started_request_message
+  
+  if websocket.possible? && allow_request_origin?
+    respond_to_successful_request
+  else
+    respond_to_invalid_request
+  end
+end
+```
+
+**検証ステップ**:
+1. WebSocketアップグレードが可能かチェック
+2. Origin検証でCSRF攻撃を防止
+3. 成功時：`websocket.rack_response`でWebSocketハンドシェイク完了
+4. 失敗時：404レスポンスで接続拒否
+
+#### 6. WebSocket接続確立後の初期化フロー
+
+**a) WebSocketドライバー開始** (`client_socket.rb:59-69`):
+```ruby
+def start_driver
+  return if @driver.nil? || @driver_started
+  @stream.hijack_rack_socket  # Rackソケットをハイジャック
+  
+  if callback = @env["async.callback"]
+    callback.call([101, {}, @stream])  # HTTP 101 Switching Protocols
+  end
+  
+  @driver_started = true
+  @driver.start
+end
+```
+
+**b) Connection開始処理** (`base.rb:199-209`):
+```ruby
+def handle_open
+  @protocol = websocket.protocol
+  connect if respond_to?(:connect)          # ユーザー定義connect処理
+  subscribe_to_internal_channel
+  send_welcome_message
+  
+  message_buffer.process!                   # バッファーされたメッセージ処理
+  server.add_connection(self)               # サーバーに接続を登録
+rescue ActionCable::Connection::Authorization::UnauthorizedError
+  close(reason: ActionCable::INTERNAL[:disconnect_reasons][:unauthorized], reconnect: false) if websocket.alive?
+end
+```
+
+#### 7. イベント委譲パターン
+
+WebSocketイベントがConnection::Baseメソッドに委譲される仕組み：
+
+- `@driver.on(:open)` → `open` → `@event_target.on_open` → `Connection::Base#handle_open`
+- `@driver.on(:message)` → `receive_message` → `@event_target.on_message` → `Connection::Base#message_buffer.append`
+- `@driver.on(:close)` → `begin_close` → `@event_target.on_close` → `Connection::Base#handle_close`
+- `@driver.on(:error)` → `emit_error` → `@event_target.on_error` → `Connection::Base#on_error`
+
+### 完全な接続フロー図
+
+```
+1. HTTP WebSocket Upgrade Request
+        ↓
+2. ActionCable::Server::Base#call
+        ↓
+3. Connection::Base.new(server, env)
+        ↓
+4. Connection::WebSocket.new(env, connection, event_loop)
+        ↓
+5. Connection::ClientSocket.new(env, connection, event_loop, protocols)
+        ↓
+6. ::WebSocket::Driver.rack(client_socket)
+        ↓
+7. Connection::Stream.new(event_loop, client_socket)
+        ↓
+8. connection.process (WebSocket upgrade validation)
+        ↓
+9. websocket.rack_response → client_socket.start_driver
+        ↓
+10. stream.hijack_rack_socket (HTTP → WebSocket conversion)
+        ↓
+11. driver.start → WebSocket handshake completion
+        ↓
+12. driver.on(:open) → connection.handle_open
+        ↓
+13. user.connect + server.add_connection(connection)
+```
+
+### 主要な学習ポイント
+
+1. **3層WebSocket抽象化**: WebSocket → ClientSocket → Stream
+2. **イベント駆動アーキテクチャ**: WebSocketイベントをConnection::Baseに委譲
+3. **プロトコル準拠**: `::WebSocket::Driver.rack`でRFC準拠のWebSocket実装
+4. **Rackソケットハイジャック**: `@stream.hijack_rack_socket`でHTTP接続をWebSocketに変換
+5. **非同期初期化**: `handle_open`でのユーザー認証と接続登録
+6. **Connection/Channel分離**: Connectionは接続管理、Channelはビジネスロジック
+7. **セキュリティ考慮**: Origin検証とUnauthorizedError処理
+
+---
+
+## セッション8: WebSocket接続フローの完全解析 - 追加調査
+- 日付/時間: 2025-01-26 WebSocket接続フロー統合調査
+- 対象範囲: actioncable/lib/action_cable/connection/base.rb, client_socket.rb
+- 目的: WebSocket接続からConnectionインスタンス作成までの完全なフローを文書化
+
+### WebSocket接続フローの詳細解析
+
+#### HTTPからWebSocketへの変換プロセス
+
+**1. HTTPリクエスト受信**
+```
+GET /cable HTTP/1.1
+Connection: Upgrade
+Upgrade: websocket
+```
+
+**2. Rails Router/Rackによる処理**
+- Action Cableのマウントポイントでキャッチ
+- `ActionCable::Server::Base#call(env)` が呼び出される
+
+**3. Connection::Base インスタンス作成** (`base.rb:67-79`)
+```ruby
+def initialize(server, env, coder: ActiveSupport::JSON)
+  @server, @env, @coder = server, env, coder
+  @worker_pool = server.worker_pool
+  @logger = new_tagged_logger
+  
+  # 重要: WebSocket抽象化レイヤーの構築
+  @websocket      = ActionCable::Connection::WebSocket.new(env, self, event_loop)
+  @subscriptions  = ActionCable::Connection::Subscriptions.new(self)
+  @message_buffer = ActionCable::Connection::MessageBuffer.new(self)
+end
+```
+
+#### 3層WebSocket抽象化アーキテクチャ
+
+**レイヤー1: Connection::WebSocket** (プロキシ)
+- 外部APIの簡潔性を保つためのプロキシクラス
+- `possible?`, `protocol`, `transmit`, `close`, `rack_response` を提供
+- 実際の処理は ClientSocket に移譲
+
+**レイヤー2: Connection::ClientSocket** (WebSocketプロトコル)
+- `faye-websocket-ruby` ベースの実装
+- `::WebSocket::Driver.rack` でプロトコル準拠のドライバー作成
+- WebSocketステート管理 (CONNECTING, OPEN, CLOSING, CLOSED)
+
+**レイヤー3: Connection::Stream** (I/O管理)
+- Rackソケットのハイジャック処理
+- Event Loopとの統合
+- 実際のTCP/WebSocketレベルのI/O
+
+#### WebSocketドライバーの初期化 (`client_socket.rb:36-57`)
+
+```ruby
+def initialize(env, event_target, event_loop, protocols)
+  @env          = env
+  @event_target = event_target  # Connection::Baseインスタンス
+  @event_loop   = event_loop
+  
+  # WebSocketドライバー作成
+  @driver = ::WebSocket::Driver.rack(self, protocols: protocols)
+  
+  # イベント委譲の設定
+  @driver.on(:open)    { |e| open }
+  @driver.on(:message) { |e| receive_message(e.data) }
+  @driver.on(:close)   { |e| begin_close(e.reason, e.code) }
+  @driver.on(:error)   { |e| emit_error(e.message) }
+end
+```
+
+#### WebSocketハンドシェイクとConnection確立
+
+**1. 接続検証** (`base.rb:85-93`)
+```ruby
+def process
+  if websocket.possible? && allow_request_origin?
+    respond_to_successful_request  # WebSocketハンドシェイク
+  else
+    respond_to_invalid_request     # 404レスポンス
+  end
+end
+```
+
+**2. WebSocketドライバー開始** (`client_socket.rb:59-69`)
+```ruby
+def start_driver
+  @stream.hijack_rack_socket  # HTTP接続をハイジャック
+  
+  if callback = @env["async.callback"]
+    callback.call([101, {}, @stream])  # HTTP 101 Switching Protocols
+  end
+  
+  @driver.start
+end
+```
+
+**3. Connection初期化完了** (`base.rb:199-209`)
+```ruby
+def handle_open
+  @protocol = websocket.protocol
+  connect if respond_to?(:connect)      # ユーザー定義認証
+  subscribe_to_internal_channel
+  send_welcome_message
+  
+  message_buffer.process!               # バッファー処理開始
+  server.add_connection(self)           # サーバーに接続登録
+end
+```
+
+#### イベント委譲メカニズム
+
+WebSocketイベントがConnection::Baseに委譲される仕組み:
+
+```
+WebSocketドライバー → ClientSocket → Connection::Base
+
+@driver.on(:open)    → open()          → @event_target.on_open()    → handle_open()
+@driver.on(:message) → receive_message → @event_target.on_message() → message_buffer.append()
+@driver.on(:close)   → begin_close()   → @event_target.on_close()   → handle_close()
+@driver.on(:error)   → emit_error()    → @event_target.on_error()   → ログ出力
+```
+
+### 重要な設計決定の理解
+
+#### 1. なぜ3層抽象化なのか？
+- **WebSocket**: 簡潔なAPI、テスト容易性
+- **ClientSocket**: WebSocketプロトコル準拠、faye-websocket統合
+- **Stream**: Event Loop統合、Rackハイジャック処理
+
+#### 2. イベント駆動アーキテクチャの利点
+- WebSocketライフサイクルとConnection処理の分離
+- 非同期イベント処理の統一
+- テスタビリティの向上
+
+#### 3. MessageBufferの重要性
+- WebSocket確立とConnection初期化のタイミングギャップを解決
+- メッセージの順序保証
+- 初期化中のメッセージロストを防止
+
+### 完全な接続フロー図
+
+```
+1. HTTP WebSocket Upgrade Request
+        ↓
+2. ActionCable::Server::Base#call(env)
+        ↓
+3. config.connection_class.call - クラス動的解決
+        ↓
+4. Connection::Base.new(server, env) - 依存関係構築
+        ↓
+5. Connection::WebSocket.new() - プロキシ作成
+        ↓
+6. Connection::ClientSocket.new() - ドライバー初期化
+        ↓
+7. ::WebSocket::Driver.rack() - プロトコル準拠ドライバー
+        ↓
+8. Connection::Stream.new() - I/O管理
+        ↓
+9. connection.process() - 接続検証
+        ↓
+10. websocket.rack_response() → start_driver()
+        ↓
+11. stream.hijack_rack_socket() - HTTP→WebSocket変換
+        ↓
+12. driver.start() → WebSocketハンドシェイク
+        ↓
+13. driver.on(:open) → handle_open()
+        ↓
+14. user.connect() + server.add_connection()
+```
+
+### 学習ポイントの統合
+
+1. **プロトコル準拠**: RFC準拠のWebSocket実装を `::WebSocket::Driver.rack` で実現
+2. **責任分離**: HTTP処理、WebSocketプロトコル、I/O管理を適切に分離
+3. **Event Loop統合**: 非ブロッキングI/Oとイベント駆動処理
+4. **セキュリティ**: Origin検証、認証失敗時の適切な切断処理
+5. **タイミング制御**: MessageBufferによる初期化タイミング問題の解決
+
+---
+
+## セッション9: WebSocket接続後のサブスクリプション確立プロセス
+- 日付/時間: 2025-01-26 サブスクリプション確立調査
+- 対象範囲: connection/subscriptions.rb, channel/base.rb, action_cable.js
+- 目的: 接続確立後のチャンネルサブスクリプション処理フローを理解
+
+### サブスクリプション確立の完全フロー
+
+#### 1. クライアントサイド - JavaScript での開始 (`action_cable.js`)
+
+**ステップ1: Consumer による Subscription 作成**
+```javascript
+// ユーザーコード
+const consumer = ActionCable.createConsumer();
+const subscription = consumer.subscriptions.create("ChatChannel", {
+  received: function(data) { ... }
+});
+```
+
+**ステップ2: Subscriptions.create() 処理** (`action_cable.js:373-379`)
+```javascript
+create(channelName, mixin) {
+  const params = typeof channel === "object" ? channel : { channel: channel };
+  const subscription = new Subscription(this.consumer, params, mixin);
+  return this.add(subscription);
+}
+```
+
+**ステップ3: Subscription インスタンス作成** (`action_cable.js:311-315`)
+```javascript
+constructor(consumer, params = {}, mixin) {
+  this.consumer = consumer;
+  this.identifier = JSON.stringify(params);  // {"channel":"ChatChannel"}
+  extend(this, mixin);
+}
+```
+
+**ステップ4: Subscriptions.add() でサブスクリプション登録** (`action_cable.js:381-386`)
+```javascript
+add(subscription) {
+  this.subscriptions.push(subscription);
+  this.consumer.ensureActiveConnection();     // 接続確保
+  this.notify(subscription, "initialized");  // initialized コールバック
+  this.subscribe(subscription);              // 実際のサブスクライブ送信
+  return subscription;
+}
+```
+
+**ステップ5: サブスクライブ コマンド送信** (`action_cable.js:425-429`)
+```javascript
+subscribe(subscription) {
+  if (this.sendCommand(subscription, "subscribe")) {
+    this.guarantor.guarantee(subscription);   // 再購読保証
+  }
+}
+
+sendCommand(subscription, command) {
+  return this.consumer.send({
+    command: command,                         // "subscribe"
+    identifier: subscription.identifier      // JSON文字列
+  });
+}
+```
+
+#### 2. サーバーサイド - WebSocket メッセージ受信処理
+
+**ステップ6: WebSocket メッセージ受信** (`connection/base.rb:97-113`)
+```ruby
+def receive(websocket_message)
+  send_async :dispatch_websocket_message, websocket_message
+end
+
+def dispatch_websocket_message(websocket_message)
+  if websocket.alive?
+    handle_channel_command decode(websocket_message)
+  end
+end
+
+def handle_channel_command(payload)
+  run_callbacks :command do
+    subscriptions.execute_command payload
+  end
+end
+```
+
+**ステップ7: Subscriptions.execute_command()** (`connection/subscriptions.rb:20-31`)
+```ruby
+def execute_command(data)
+  case data["command"]
+  when "subscribe"   then add data           # サブスクライブ処理
+  when "unsubscribe" then remove data
+  when "message"     then perform_action data
+  else
+    logger.error "Received unrecognized command in #{data.inspect}"
+  end
+end
+```
+
+**ステップ8: Subscriptions.add() - チャンネル作成** (`connection/subscriptions.rb:33-48`)
+```ruby
+def add(data)
+  id_key = data["identifier"]                              # JSON文字列
+  id_options = ActiveSupport::JSON.decode(id_key).with_indifferent_access
+  
+  return if subscriptions.key?(id_key)                     # 重複チェック
+  
+  subscription_klass = id_options[:channel].safe_constantize  # クラス解決
+  
+  if subscription_klass && ActionCable::Channel::Base > subscription_klass
+    subscription = subscription_klass.new(connection, id_key, id_options)
+    subscriptions[id_key] = subscription                   # 登録
+    subscription.subscribe_to_channel                      # チャンネル購読開始
+  else
+    logger.error "Subscription class not found: #{id_options[:channel].inspect}"
+  end
+end
+```
+
+#### 3. チャンネル購読確立処理
+
+**ステップ9: Channel インスタンス作成と購読処理** (`channel/base.rb:191-198`)
+```ruby
+def subscribe_to_channel
+  run_callbacks :subscribe do
+    subscribed                                   # ユーザー定義 subscribed コールバック
+  end
+  
+  reject_subscription if subscription_rejected?  # 拒否チェック
+  ensure_confirmation_sent                       # 確認送信
+end
+```
+
+**ステップ10: ユーザー定義 subscribed コールバック実行**
+```ruby
+# ユーザー定義チャンネル例
+class ChatChannel < ApplicationCable::Channel
+  def subscribed
+    stream_from "chat_room_#{params[:room_id]}"  # ストリーム購読
+  end
+end
+```
+
+**ステップ11: サブスクリプション確認送信** (`channel/base.rb`)
+```ruby
+def ensure_confirmation_sent
+  return if subscription_rejected? || @confirmation_sent
+  
+  logger.info "#{self.class.name} is transmitting the subscription confirmation"
+  connection.transmit identifier: @identifier, 
+                      type: ActionCable::INTERNAL[:message_types][:confirmation]
+  @confirmation_sent = true
+end
+```
+
+#### 4. クライアントサイド - 確認受信処理
+
+**ステップ12: 確認メッセージ受信** (`action_cable.js:430-433`)
+```javascript
+confirmSubscription(identifier) {
+  logger.log(`Subscription confirmed ${identifier}`);
+  this.findAll(identifier).map((subscription => 
+    this.guarantor.forget(subscription)       // 再購読保証から除外
+  ));
+}
+```
+
+**ステップ13: connected コールバック実行**
+```javascript
+// ユーザーコード
+consumer.subscriptions.create("ChatChannel", {
+  connected: function() {
+    console.log("Connected to ChatChannel");   // 購読完了
+  },
+  received: function(data) { ... }
+});
+```
+
+### サブスクリプション確立の重要メカニズム
+
+#### 1. **識別子 (identifier) による管理**
+- クライアント: `JSON.stringify(params)` で生成
+- サーバー: JSON パース後にチャンネルクラス解決
+- 同一 identifier での重複購読を防止
+
+#### 2. **SubscriptionGuarantor による信頼性**
+- 購読失敗時の自動再試行 (500ms間隔)
+- 接続断後の再購読保証
+- 確認受信まで再試行を継続
+
+#### 3. **非同期確認メカニズム**
+- サーバー: `subscribed` コールバック成功後に確認送信
+- クライアント: 確認受信後に `connected` コールバック実行
+- 購読拒否時は `rejected` コールバック実行
+
+#### 4. **エラーハンドリング**
+- 存在しないチャンネルクラス: エラーログ出力
+- 購読拒否: `reject` メソッドで明示的拒否可能
+- 接続切断時: 自動的な全サブスクリプション解除
+
+### 完全なサブスクリプション確立フロー図
+
+```
+1. consumer.subscriptions.create("ChatChannel", callbacks)
+        ↓
+2. new Subscription(consumer, {channel: "ChatChannel"}, callbacks)
+        ↓
+3. subscriptions.add(subscription) - 配列に追加
+        ↓
+4. subscription.subscribe() - "subscribe" コマンド送信
+        ↓
+5. WebSocket メッセージ → connection.receive()
+        ↓
+6. subscriptions.execute_command({command: "subscribe", identifier: "..."})
+        ↓
+7. subscriptions.add() - チャンネルクラス解決
+        ↓
+8. ChatChannel.new(connection, identifier, params)
+        ↓
+9. channel.subscribe_to_channel() - 購読処理開始
+        ↓
+10. channel.subscribed() - ユーザー定義コールバック実行
+        ↓
+11. channel.ensure_confirmation_sent() - 確認メッセージ送信
+        ↓
+12. subscriptions.confirmSubscription(identifier) - 確認受信
+        ↓
+13. subscription.connected() - クライアント側 connected コールバック
+```
+
+### 学習ポイント
+
+1. **双方向確認プロトコル**: クライアント要求 → サーバー処理 → 確認応答
+2. **動的クラス解決**: JSON identifier からチャンネルクラスを動的作成
+3. **非同期処理**: Worker Pool を使用した購読処理の非同期化
+4. **信頼性保証**: SubscriptionGuarantor による再試行メカニズム
+5. **ライフサイクル管理**: initialized → subscribed → connected の段階的処理
+
+---
+
+## セッション10: Event Loopアーキテクチャとクライアント接続待ち受け処理
+- 日付/時間: 2025-01-26 Event Loop詳細調査
+- 対象範囲: connection/stream_event_loop.rb, connection/stream.rb, channel/streams.rb
+- 目的: チャンネルにおけるクライアント接続待ち受けとイベント処理の流れを理解
+
+### Action Cable Event Loopの核心アーキテクチャ
+
+#### 1. StreamEventLoopの基本構造 (`stream_event_loop.rb`)
+
+**Event Loopの初期化**
+```ruby
+def initialize
+  @nio = @executor = @thread = nil    # 遅延初期化
+  @map = {}                           # IO → Stream のマッピング
+  @stopping = false                   # 停止フラグ
+  @todo = Queue.new                   # タスクキュー
+  @spawn_mutex = Mutex.new            # スレッド作成保護
+end
+```
+
+**NIO-based I/O多重化**
+```ruby
+def spawn
+  @nio ||= NIO::Selector.new                    # ノンブロッキングI/Oセレクター
+  @executor ||= Concurrent::ThreadPoolExecutor.new(
+    name: "ActionCable-streamer",
+    min_threads: 1,
+    max_threads: 10,                            # Stream処理用スレッドプール
+    max_queue: 0,
+  )
+  @thread = Thread.new { run }                  # メインイベントループスレッド
+end
+```
+
+#### 2. WebSocket接続のEvent Loop統合フロー
+
+**ステップ1: WebSocket接続確立時のI/O登録**
+```ruby
+# stream.rb:106
+def hijack_rack_socket
+  @rack_hijack_io = @socket_object.env["rack.hijack"].call
+  @event_loop.attach(@rack_hijack_io, self)           # Event LoopにI/O登録
+end
+
+# stream_event_loop.rb:30-36
+def attach(io, stream)
+  @todo << lambda do
+    @map[io] = @nio.register(io, :r)                  # 読み取り監視登録
+    @map[io].value = stream                           # StreamオブジェクトをIOにバインド
+  end
+  wakeup                                              # Event Loopを起動
+end
+```
+
+**ステップ2: メインEvent Loopでの接続待ち受け**
+```ruby
+# stream_event_loop.rb:87-134
+def run
+  loop do
+    return if @stopping
+    
+    # タスクキューの処理
+    until @todo.empty?
+      @todo.pop(true).call
+    end
+    
+    # I/O多重化による接続監視
+    next unless monitors = @nio.select              # ノンブロッキングI/O待機
+    
+    monitors.each do |monitor|
+      io = monitor.io
+      stream = monitor.value                        # 対応するStreamオブジェクト
+      
+      # 書き込み可能時の処理
+      if monitor.writable?
+        if stream.flush_write_buffer                # バッファーをフラッシュ
+          monitor.interests = :r                    # 読み取り専用に戻す
+        end
+      end
+      
+      # 読み取り可能時の処理
+      if monitor.readable?
+        incoming = io.read_nonblock(4096, exception: false)
+        case incoming
+        when :wait_readable
+          next
+        when nil
+          stream.close                              # クライアント切断
+        else
+          stream.receive incoming                   # データ受信処理
+        end
+      end
+    end
+  end
+end
+```
+
+#### 3. チャンネルストリーミングとEvent Loop統合
+
+**ストリーム購読の非同期処理** (`streams.rb:103-107`)
+```ruby
+def stream_from(broadcasting, callback = nil, coder: nil, &block)
+  # ... ハンドラー準備 ...
+  
+  connection.server.event_loop.post do              # Event Loopに投稿
+    pubsub.subscribe(broadcasting, handler, lambda do
+      ensure_confirmation_sent                      # 購読確認
+      logger.info "#{self.class.name} is streaming from #{broadcasting}"
+    end)
+  end
+end
+```
+
+**Event Loopでの非同期実行フロー**
+```ruby
+# stream_event_loop.rb:23-28
+def post(task = nil, &block)
+  task ||= block
+  spawn                                             # Event Loopスレッド起動
+  @executor << task                                 # ThreadPoolExecutorに投稿
+end
+```
+
+#### 4. WebSocketデータの双方向処理
+
+**クライアント → サーバー (データ受信)**
+```ruby
+# Event Loopが検知 → stream.receive(data) → client_socket.parse(data)
+def receive(data)
+  @socket_object.parse(data)                        # WebSocketプロトコル処理
+end
+
+# WebSocketドライバーがパース → Connection#on_message → message_buffer
+```
+
+**サーバー → クライアント (データ送信)**
+```ruby
+# stream.rb:37-70
+def write(data)
+  if @write_lock.try_lock
+    # 直接書き込み試行
+    written = @rack_hijack_io.write_nonblock(data, exception: false)
+    case written
+    when :wait_writable
+      # バッファーリング必要
+    when data.bytesize
+      return data.bytesize                          # 即座に送信完了
+    else
+      @write_head = data.byteslice(written, data.bytesize)
+      @event_loop.writes_pending @rack_hijack_io   # 書き込み監視要求
+    end
+  end
+  
+  @write_buffer << data                             # バッファーに追加
+  @event_loop.writes_pending @rack_hijack_io       # Event Loopに通知
+end
+```
+
+#### 5. ハートビートとコネクション管理
+
+**定期ハートビート送信** (`connections.rb:34-36`)
+```ruby
+def setup_heartbeat_timer
+  @heartbeat_timer ||= event_loop.timer(BEAT_INTERVAL) do
+    event_loop.post { connections.each(&:beat) }    # 全接続にpingを送信
+  end
+end
+```
+
+**タイマー実装** (`stream_event_loop.rb:19-21`)
+```ruby
+def timer(interval, &block)
+  Concurrent::TimerTask.new(execution_interval: interval, &block).tap(&:execute)
+end
+```
+
+### Event Loopアーキテクチャの設計思想
+
+#### 1. **Single-threaded Event Loop + Thread Pool**
+```
+┌─────────────────────────────────────────────────────────┐
+│ StreamEventLoop (1つのメインスレッド)                      │
+├─────────────────────────────────────────────────────────┤
+│ • NIO::Selector で全WebSocket I/Oを多重化                 │
+│ • ノンブロッキングI/Oで高い並行性                           │
+│ • @todo Queue でタスクのシリアル実行                       │
+└─────────────────────────────────────────────────────────┘
+                        ↓ 重い処理を移譲
+┌─────────────────────────────────────────────────────────┐
+│ Concurrent::ThreadPoolExecutor (1-10スレッド)             │
+├─────────────────────────────────────────────────────────┤
+│ • pub/sub購読処理                                         │
+│ • ストリーミングハンドラー実行                             │
+│ • コールバック実行                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### 2. **責任分離パターン**
+- **Event Loop**: I/O待機、接続管理、軽量タスク実行
+- **Worker Pool**: Channel処理、データベースアクセス、重い処理
+- **Stream**: 個別WebSocket接続のI/O管理
+
+#### 3. **非同期処理の統合**
+```ruby
+# すべての非同期操作がEvent Loopを通る
+event_loop.post { pubsub.subscribe(...) }        # ストリーム購読
+event_loop.post { connections.each(&:beat) }     # ハートビート
+event_loop.attach(io, stream)                    # WebSocket I/O登録
+event_loop.writes_pending(io)                    # 書き込み要求
+```
+
+### パフォーマンスとスケーラビリティ
+
+#### 1. **高並行接続処理**
+- **1つのEvent Loop** で数千のWebSocket接続を効率的に処理
+- **NIOセレクター** でシステムコール最小化
+- **ノンブロッキングI/O** でCPU効率最大化
+
+#### 2. **メモリ効率**
+```ruby
+@map = {}                                         # IO → Stream マッピング
+@write_buffer = Queue.new                         # 接続毎の書き込みバッファー
+monitors.each { |monitor| ... }                  # アクティブな接続のみ処理
+```
+
+#### 3. **バックプレッシャー対応**
+- 書き込みバッファーでクライアント送信レート制御
+- `write_nonblock` で送信可能性チェック
+- `:wait_writable` でフロー制御
+
+### Event Loop使用パターン
+
+#### 1. **ストリーム購読** (最重要)
+```ruby
+event_loop.post do
+  pubsub.subscribe(broadcasting, handler, confirmation_callback)
+end
+```
+
+#### 2. **内部チャンネル管理**
+```ruby
+event_loop.post { pubsub.subscribe(internal_channel, callback) }
+event_loop.post { pubsub.unsubscribe(channel, callback) }
+```
+
+#### 3. **アダプター統合**
+```ruby
+# Redis, PostgreSQL, Async すべてのアダプターが event_loop.post を使用
+@event_loop.post { super }                       # コールバック実行の非同期化
+```
+
+### 学習ポイント
+
+1. **Event-driven Architecture**: すべての非同期処理がEvent Loopを中心に統合
+2. **NIO-based I/O Multiplexing**: 高効率なWebSocket接続管理
+3. **Thread Pool Integration**: I/O処理と重い処理の適切な分離
+4. **Flow Control**: バックプレッシャーとバッファーリングによる安定性
+5. **Unified Async Model**: ストリーム、ハートビート、アダプターの統一的な非同期処理
+
+**次のステップ**: 実際のパフォーマンス測定とスケーラビリティ検証
