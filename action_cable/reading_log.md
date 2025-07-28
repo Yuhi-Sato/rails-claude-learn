@@ -1858,4 +1858,181 @@ event_loop.post { pubsub.unsubscribe(channel, callback) }
 4. **Flow Control**: バックプレッシャーとバッファーリングによる安定性
 5. **Unified Async Model**: ストリーム、ハートビート、アダプターの統一的な非同期処理
 
-**次のステップ**: 実際のパフォーマンス測定とスケーラビリティ検証
+---
+
+## セッション11: チャンネルインスタンス作成タイミングとRedisの関係性調査
+- 日付/時間: 2025-01-26 チャンネルライフサイクルとRedis関係性調査  
+- 対象範囲: connection/subscriptions.rb, channel/base.rb, channel/streams.rb
+- 目的: 「subscribeされるまでチャネルインスタンスは作成されないの？」「Redisは経由しないの？」という疑問の検証
+
+### 見つけた事実 / 理解したこと
+
+#### 1. チャンネルインスタンス作成の正確なタイミング
+
+**Connection初期化時** (`connection/base.rb:74-75`)
+```ruby
+def initialize(server, env, coder: ActiveSupport::JSON)
+  # ...
+  @subscriptions = ActionCable::Connection::Subscriptions.new(self)  # 管理オブジェクトのみ
+end
+```
+- Connection初期化時は**Subscriptionsオブジェクト**（管理コンテナ）のみ作成
+- 個別のチャンネルインスタンスは作成されない
+
+**Subscriptions初期化時** (`connection/subscriptions.rb:15-18`)
+```ruby
+def initialize(connection)
+  @connection = connection
+  @subscriptions = {}                    # 空のハッシュ
+end
+```
+- `@subscriptions` は空のハッシュで初期化
+- まだチャンネルインスタンスは存在しない
+
+**subscribe コマンド受信時** (`connection/subscriptions.rb:42-44`)
+```ruby
+def add(data)
+  # チャンネルクラス解決（ローカル処理）
+  subscription_klass = id_options[:channel].safe_constantize
+  
+  # チャンネルインスタンス作成（ローカル処理、Redisなし）
+  subscription = subscription_klass.new(connection, id_key, id_options)
+  subscriptions[id_key] = subscription                    # ローカルハッシュに保存
+  
+  # ここでRedisが初めて登場
+  subscription.subscribe_to_channel                       # Redis Pub/Sub購読開始
+end
+```
+
+#### 2. チャンネルインスタンス作成におけるRedisの関与
+
+**重要な結論: チャンネルインスタンス作成でRedisは経由しません**
+
+**ローカル処理のみで完結する部分**:
+1. **クラス解決**: `safe_constantize` でローカルクラス参照
+2. **インスタンス作成**: `.new(connection, id_key, id_options)` でメモリ内オブジェクト作成
+3. **管理ハッシュ登録**: `subscriptions[id_key] = subscription` でローカル保存
+
+**Redisが関与するのは `subscribe_to_channel` 以降**:
+
+**ストリーミング購読開始** (`streams.rb:103-107`)
+```ruby
+def stream_from(broadcasting, callback = nil, coder: nil, &block)
+  # チャンネルインスタンスは既に作成済み
+  connection.server.event_loop.post do
+    pubsub.subscribe(broadcasting, handler, confirmation_callback)  # ← ここでRedis使用
+  end
+end
+```
+
+#### 3. 処理の分離とアーキテクチャ設計
+
+**段階的な処理フロー**:
+```
+【Phase 1: ローカル処理】チャンネルインスタンス作成
+1. subscribe コマンド受信
+2. チャンネルクラス解決 (safe_constantize)
+3. インスタンス作成 (.new)  
+4. ローカル管理ハッシュに登録
+        ↓
+【Phase 2: Redis処理】ストリーミング開始
+5. Redis Pub/Sub購読 (pubsub.subscribe)
+6. Event Loopとの統合
+7. ブロードキャスト受信待機開始
+```
+
+**責任分離の明確化**:
+- **チャンネルインスタンス**: WebSocket接続固有のビジネスロジック、状態管理
+- **Redis**: 複数サーバー間でのメッセージ配信、Pub/Sub機能
+
+#### 4. Redis使用パターンの整理
+
+**Redisが関与する処理**:
+
+1. **ブロードキャスト送信**
+```ruby
+ActionCable.server.broadcast "chat_room_1", { message: "Hello" }
+# → Redis PUBLISH chat_room_1 '{"message":"Hello"}'
+```
+
+2. **ストリーミング購読**
+```ruby
+stream_from "chat_room_1"  
+# → Redis SUBSCRIBE chat_room_1
+```
+
+3. **複数サーバー間でのメッセージ配信**
+```
+サーバーA → Redis PUBLISH → サーバーB,C,D → 各接続のチャンネルインスタンス
+```
+
+**Redisが関与しない処理**:
+
+1. **チャンネルインスタンス作成・削除**（完全にローカル）
+2. **WebSocketメッセージの直接処理**（Connection → Channel）
+3. **チャンネル内のビジネスロジック実行**（perform_action等）
+
+### 仮説検証結果
+
+| 仮説 | 結果 | 根拠 (ファイル/行/実験) | 次アクション |
+|------|------|--------------------------|--------------|  
+| チャンネルインスタンスはsubscribeされるまで作成されない | ✓完全に正しい | subscriptions.rb:42 で subscription_klass.new() が subscribe コマンド受信時にのみ実行 | - |
+| チャンネルインスタンス作成でRedisが経由される | ✗間違い | subscriptions.rb:42-44 でローカル処理のみ、Redis使用は subscribe_to_channel 以降 | - |
+| Redisはストリーミング開始時から関与する | ✓完全に正しい | streams.rb:103-107 で pubsub.subscribe 呼び出し時に初めてRedis使用 | Redis接続失敗時の動作確認 |
+
+### 設計原則の理解
+
+#### 1. **Lazy Instantiation + Local Processing**
+- チャンネルインスタンス作成は遅延実行かつローカル処理
+- メモリ効率とネットワーク効率の両方を最適化
+- Redis接続に問題があってもチャンネルインスタンス作成は継続可能
+
+#### 2. **責任の明確な分離**
+- **ローカル処理**: インスタンス管理、ビジネスロジック実行
+- **Redis処理**: 分散メッセージング、サーバー間通信
+- **Event Loop**: 非同期処理の統合
+
+#### 3. **単一サーバー対応**
+- 開発環境では `async` アダプター使用（Redisなし）
+- チャンネルインスタンス作成ロジックはアダプターに依存しない
+- プロダクション環境への移行時の互換性確保
+
+### チャンネルインスタンス + Redis統合フロー
+
+```
+1. クライアント "subscribe" コマンド送信
+        ↓
+2. Connection が WebSocket メッセージ受信
+        ↓
+3. subscriptions.add(data) 実行
+        ↓
+4. 【ローカル処理】subscription_klass.safe_constantize
+        ↓
+5. 【ローカル処理】subscription_klass.new(connection, id_key, id_options)
+        ↓
+6. 【ローカル処理】subscriptions[id_key] = subscription
+        ↓
+7. subscription.subscribe_to_channel 実行
+        ↓
+8. channel.subscribed() ユーザー定義コールバック実行
+        ↓
+9. stream_from("broadcasting_name") が呼ばれる場合
+        ↓
+10. 【Redis処理】event_loop.post { pubsub.subscribe(broadcasting, handler) }
+        ↓
+11. 【Redis処理】Redis SUBSCRIBE broadcasting_name コマンド発行
+        ↓
+12. 【Redis処理】Redis接続確立、購読開始
+        ↓
+13. ensure_confirmation_sent でクライアントに確認送信
+```
+
+### 学習ポイント
+
+1. **チャンネルインスタンス作成はローカル処理のみ**（Redisなし）
+2. **Redisはストリーミング開始時から関与**（pubsub.subscribe）
+3. **責任分離による効率的な設計**（ローカル処理 vs 分散処理）
+4. **単一サーバー環境でも動作する汎用性**（アダプター抽象化）
+5. **遅延インスタンス化 + 段階的Redis統合**（メモリとネットワーク効率）
+
+**次のステップ**: Redis接続失敗時のチャンネルインスタンス動作確認とエラーハンドリング調査
