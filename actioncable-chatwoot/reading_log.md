@@ -60,11 +60,108 @@
 - **自動再接続**: フロントエンドでの堅牢な再接続ロジック
 - **イベント駆動**: Wisperを使った疎結合なブロードキャスト
 
+---
+
+# ActionCable関連ファイル全体像マップ
+
+## 📁 ファイル構成と役割
+
+### 🏗️ **サーバーサイド（Rails）**
+
+#### **設定・初期化**
+- `config/cable.yml` - ActionCable基本設定（Redis、チャンネルプリフィックス）
+- `config/initializers/actioncable.rb` - Redis設定カスタマイズ（GCP Memorystore対応）
+
+#### **チャンネル層**
+- `app/channels/application_cable/connection.rb` - 空の基底接続クラス
+- `app/channels/application_cable/channel.rb` - 空の基底チャンネルクラス
+- `app/channels/room_channel.rb` - **唯一の具体的チャンネル**（全機能を担当）
+
+#### **ブロードキャスト層**
+- `app/listeners/action_cable_listener.rb` - **メインリスナー**（40+イベントハンドラ）
+- `app/jobs/action_cable_broadcast_job.rb` - 非同期ブロードキャスト処理
+- `enterprise/app/listeners/enterprise/action_cable_listener.rb` - Enterprise機能拡張
+
+#### **認証・プレゼンス**
+- `app/models/concerns/pubsubable.rb` - **pubsub_token管理モジュール**
+- `lib/online_status_tracker.rb` - **在席状況管理**（Redis Sorted Set使用）
+- `app/models/user.rb:47` - `include Pubsubable`
+- `app/models/contact_inbox.rb:24` - `include Pubsubable`
+
+### 🌐 **クライアントサイド（JavaScript）**
+
+#### **共通基盤**
+- `app/javascript/shared/helpers/BaseActionCableConnector.js` - **基底コネクタクラス**
+  - 自動再接続機能（1秒間隔チェック）
+  - プレゼンス更新（20秒間隔）
+  - WebSocket URL設定対応
+
+#### **アプリケーション別実装**
+- `app/javascript/dashboard/helper/actionCable.js` - **Dashboard用コネクタ**
+  - 35+イベントハンドラ
+  - Vuex完全統合
+  - 音声通知、タイピング表示等
+
+- `app/javascript/widget/helpers/actionCable.js` - **Widget用コネクタ**
+  - 軽量実装（8イベントのみ）
+  - IFrame通信対応
+  - 切断時メッセージ同期
+
+### 🧪 **テスト**
+- `spec/channels/room_channel_spec.rb` - チャンネルのユニットテスト
+- `spec/listeners/action_cable_listener_spec.rb` - リスナーテスト
+- `app/javascript/dashboard/helper/specs/actionCable.spec.js` - フロントエンドテスト
+
+## 🔗 **データフロー全体像**
+
+```
+モデル変更 → Wisperイベント → ActionCableListener → ActionCableBroadcastJob
+     ↓
+Redis（チャンネル） → ActionCable → WebSocket → クライアント
+     ↓
+BaseActionCableConnector → 各アプリのConnector → Vuexストア
+```
+
+## 🏛️ **アーキテクチャの特徴**
+
+### **単一責任の分離**
+- **RoomChannel**: 全リアルタイム通信の単一エントリポイント
+- **ActionCableListener**: イベント→ブロードキャスト変換
+- **OnlineStatusTracker**: プレゼンス管理専用
+- **Pubsubable**: トークン管理専用
+
+### **認証戦略**
+- Connection層での認証なし（意図的な設計）
+- Channel層でpubsub_tokenによる認証
+- User/ContactInbox両対応
+- パスワード変更時の自動トークンローテーション
+
+### **スケーラビリティ対策**
+- Redis Sorted Setでの効率的プレゼンス管理
+- 非同期ブロードキャスト（Sidekiq使用）
+- データ新鮮性保証（最新データ再取得）
+- GCP Memorystore対応
+
+## 🎯 **重要な設計判断**
+
+1. **なぜConnection層で認証しないのか？**
+   - ユーザー/ゲスト混在対応のため
+   - チャンネルレベルでの柔軟な認証制御
+
+2. **なぜ単一チャンネル設計？**
+   - 管理の簡素化
+   - pubsub_tokenによる効率的フィルタリング
+
+3. **なぜ非同期ブロードキャスト？**
+   - UIブロック防止
+   - 大量ユーザーへの安定配信
+
 ## 5. TODO/フォローアップ
 - [x] 基本設定ファイルの確認完了
 - [x] チャンネル実装の詳細確認
 - [x] フロントエンド連携の確認
-- [ ] pubsub_tokenの生成・管理方法の確認
-- [ ] OnlineStatusTrackerの実装詳細
-- [ ] テスト実装の確認（spec/channels/）
+- [x] pubsub_tokenの生成・管理方法の確認
+- [x] OnlineStatusTrackerの実装詳細
+- [x] ファイル構成と全体像の整理
+- [ ] テスト実装の詳細確認（spec/channels/）
 - [ ] パフォーマンス・スケーラビリティ考慮事項の調査
